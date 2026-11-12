@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: mrkrishna-payment-api
+    runtime: go
+    plan: starter
+    buildCommand: go mod tidy && go build -o app .
+    startCommand: ./app
+    healthCheckPath: /health
+    envVars:
+      - key: BASE_URL
+        sync: false
+      - key: UPI_ID
+        sync: false
+      - key: UPI_NAME
+        value: MrKrishna
+      - key: GMAIL_USER
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: FAMPAY_OFFICIAL_EMAIL
+        sync: false
+      - key: DATABASE_PATH
+        value: /var/data/db.sqlite
+    disk:
+      name: payment-data
+      mountPath: /var/data
+      sizeGB: 1

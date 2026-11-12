@@ -331,7 +331,7 @@ func (a *App) fetchEmails() ([]Notice, error) {
 		}
 		messageID := m.Envelope.MessageId
 		if messageID == "" {
-			messageID = fmt.Sprintf("seq-%d", m.Seq)
+			messageID = fmt.Sprintf("seq-%d", m.SeqNum)
 		}
 		result = append(result, Notice{messageID, sender, subject, raw, tid, amount})
 	}

@@ -80,7 +80,7 @@ func main() {
 	db.SetMaxOpenConns(1)
 	schema := []string{
 		`PRAGMA journal_mode=WAL;`, `PRAGMA busy_timeout=5000;`,
-		`CREATE TABLE IF NOT EXISTS payments(txn TEXT PRIMARY KEY,amount INTEGER NOT NULL,upi_id TEXT NOT NULL,uri TEXT NOT NULL,payment_link TEXT NOT NULL,qr_link TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'PENDING',created TEXT NOT NULL,deadline TEXT NOT NULL,verify_at TEXT,confirmed_at TEXT,paid_at TEXT,updated TEXT NOT NULL);`,
+		`CREATE TABLE IF NOT EXISTS payments(txn TEXT PRIMARY KEY,amount INTEGER NOT NULL,requested_amount INTEGER NOT NULL DEFAULT 0,upi_id TEXT NOT NULL,uri TEXT NOT NULL,payment_link TEXT NOT NULL,qr_link TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'PENDING',created TEXT NOT NULL,deadline TEXT NOT NULL,verify_at TEXT,confirmed_at TEXT,paid_at TEXT,updated TEXT NOT NULL);`,
 		`CREATE INDEX IF NOT EXISTS payments_pending ON payments(status,deadline);`,
 		`CREATE TABLE IF NOT EXISTS emails(message_id TEXT PRIMARY KEY,sender TEXT,subject TEXT,body TEXT,txn TEXT,amount INTEGER,received TEXT,processed TEXT);`,
 		`CREATE TABLE IF NOT EXISTS verification_logs(id INTEGER PRIMARY KEY,txn TEXT,kind TEXT,result TEXT,email_id TEXT,checked TEXT);`,
@@ -89,6 +89,13 @@ func main() {
 		if _, e = db.Exec(q); e != nil {
 			log.Fatal(e)
 		}
+	}
+	if _, e = db.Exec(`ALTER TABLE payments ADD COLUMN requested_amount INTEGER NOT NULL DEFAULT 0`); e != nil &&
+		!strings.Contains(strings.ToLower(e.Error()), "duplicate column") {
+		log.Fatal(e)
+	}
+	if _, e = db.Exec(`UPDATE payments SET requested_amount=amount WHERE requested_amount=0`); e != nil {
+		log.Fatal(e)
 	}
 	a := &App{c, db, sync.Mutex{}}
 	mux := http.NewServeMux()
@@ -154,22 +161,82 @@ func (a *App) create(w http.ResponseWriter, r *http.Request, withPage bool) {
 		out(w, 503, map[string]any{"success": false, "error": "UPI_NOT_CONFIGURED"})
 		return
 	}
-	amount, ok := money(r.URL.Query().Get("value"))
+
+	requestedAmount, ok := money(r.URL.Query().Get("value"))
 	if !ok {
 		out(w, 400, map[string]any{"success": false, "error": "INVALID_AMOUNT"})
 		return
 	}
+
 	now := time.Now().In(time.FixedZone("IST", 19800))
+	deadlineTime := now.Add(time.Duration(a.cfg.expiryMins) * time.Minute)
+	created := now.Format(time.RFC3339Nano)
+	deadline := deadlineTime.Format(time.RFC3339Nano)
+
+	// Serialize allocation and insertion within this application process.
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	cutoff := now.Add(-7 * time.Minute).Format(time.RFC3339Nano)
+	upper := deadlineTime.Add(7 * time.Minute).Format(time.RFC3339Nano)
+
+	rows, err := a.db.Query(
+		`SELECT amount FROM payments
+                 WHERE status IN ('PENDING','PAID','FAILED') AND deadline>=? AND created<=?`,
+		cutoff, upper,
+	)
+	if err != nil {
+		out(w, 500, map[string]any{"success": false, "error": "DATABASE_ERROR"})
+		return
+	}
+
+	occupied := make(map[int64]bool)
+	for rows.Next() {
+		var existing int64
+		if err := rows.Scan(&existing); err != nil {
+			rows.Close()
+			out(w, 500, map[string]any{"success": false, "error": "DATABASE_ERROR"})
+			return
+		}
+		occupied[existing] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		out(w, 500, map[string]any{"success": false, "error": "DATABASE_ERROR"})
+		return
+	}
+	rows.Close()
+
+	actualAmount := requestedAmount
+	allocated := false
+
+	// Search up to 10,000 distinct paise values.
+	for i := 0; i < 10000; i++ {
+		if !occupied[actualAmount] {
+			allocated = true
+			break
+		}
+		actualAmount++
+	}
+
+	if !allocated {
+		out(w, 503, map[string]any{"success": false, "error": "UNIQUE_AMOUNT_UNAVAILABLE"})
+		return
+	}
+
 	var id string
 	for i := 0; i < 20; i++ {
-		v, e := txnID(now)
+		candidate, e := txnID(now)
 		if e != nil {
 			break
 		}
-		var n int
-		_ = a.db.QueryRow("SELECT COUNT(*) FROM payments WHERE txn=?", v).Scan(&n)
-		if n == 0 {
-			id = v
+		var count int
+		if e = a.db.QueryRow("SELECT COUNT(*) FROM payments WHERE txn=?", candidate).Scan(&count); e != nil {
+			out(w, 500, map[string]any{"success": false, "error": "DATABASE_ERROR"})
+			return
+		}
+		if count == 0 {
+			id = candidate
 			break
 		}
 	}
@@ -177,29 +244,46 @@ func (a *App) create(w http.ResponseWriter, r *http.Request, withPage bool) {
 		out(w, 500, map[string]any{"success": false, "error": "ID_GENERATION_FAILED"})
 		return
 	}
+
 	q := url.Values{}
 	q.Set("pa", a.cfg.upiID)
 	q.Set("pn", a.cfg.upiName)
-	q.Set("am", fmt.Sprintf("%d.%02d", amount/100, amount%100))
+	q.Set("am", fmt.Sprintf("%d.%02d", actualAmount/100, actualAmount%100))
 	q.Set("cu", "INR")
 	q.Set("tn", id)
 	q.Set("tr", id)
+
 	uri := "upi://pay?" + q.Encode()
 	pl := a.cfg.baseURL + "/pay/" + id
 	ql := a.cfg.baseURL + "/qr/" + id
-	created := now.Format(time.RFC3339Nano)
-	deadline := now.Add(time.Duration(a.cfg.expiryMins) * time.Minute).Format(time.RFC3339Nano)
-	_, e := a.db.Exec(`INSERT INTO payments(txn,amount,upi_id,uri,payment_link,qr_link,status,created,deadline,updated) VALUES(?,?,?,?,?,?,'PENDING',?,?,?)`, id, amount, a.cfg.upiID, uri, pl, ql, created, deadline, created)
-	if e != nil {
+
+	_, err = a.db.Exec(
+		`INSERT INTO payments(
+                        txn,amount,requested_amount,upi_id,uri,payment_link,qr_link,
+                        status,created,deadline,updated
+                 ) VALUES(?,?,?,?,?,?,?,'PENDING',?,?,?)`,
+		id, actualAmount, requestedAmount, a.cfg.upiID,
+		uri, pl, ql, created, deadline, created,
+	)
+	if err != nil {
 		out(w, 500, map[string]any{"success": false, "error": "DATABASE_ERROR"})
 		return
 	}
-	v := map[string]any{"success": true, "transaction_id": id, "amount": float64(amount) / 100, "currency": "INR", "qr_link": ql}
+
+	v := map[string]any{
+		"success":          true,
+		"transaction_id":   id,
+		"requested_amount": float64(requestedAmount) / 100,
+		"amount":           float64(actualAmount) / 100,
+		"currency":         "INR",
+		"qr_link":          ql,
+	}
 	if withPage {
 		v["payment_link"] = pl
 	}
 	out(w, 200, v)
 }
+
 func (a *App) get(id string) (Payment, error) {
 	var p Payment
 	e := a.db.QueryRow("SELECT txn,amount,uri,status,created,deadline FROM payments WHERE txn=?", id).Scan(&p.txn, &p.amount, &p.uri, &p.status, &p.created, &p.deadline)

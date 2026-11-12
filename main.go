@@ -3,12 +3,19 @@ package main
 import (
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
+	"io"
 	"log"
 	"math/big"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net/http"
 	"net/mail"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -41,6 +48,7 @@ type Payment struct {
 type Notice struct {
 	id, sender, subject, body, txn string
 	amount                         int64
+	received                       time.Time
 }
 
 func env(k, d string) string {
@@ -186,7 +194,7 @@ func (a *App) create(w http.ResponseWriter, r *http.Request, withPage bool) {
 		out(w, 500, map[string]any{"success": false, "error": "DATABASE_ERROR"})
 		return
 	}
-	v := map[string]any{"success": true, "transaction_id": id, "amount": float64(amount) / 100, "currency": "INR", "qr_link": ql, "status": "PENDING"}
+	v := map[string]any{"success": true, "transaction_id": id, "amount": float64(amount) / 100, "currency": "INR", "qr_link": ql}
 	if withPage {
 		v["payment_link"] = pl
 	}
@@ -256,113 +264,274 @@ func (a *App) mark(id, status, kind, email string) error {
 var txnRE = regexp.MustCompile(`(?i)\bMK[0-9]{12}\b`)
 var amountRE = regexp.MustCompile(`(?i)(?:₹|INR\s*)\s*([0-9,]+(?:\.[0-9]{1,2})?)`)
 
+func decodeMIMEBody(header textproto.MIMEHeader, body io.Reader) (string, error) {
+	mediaType, params, _ := mime.ParseMediaType(header.Get("Content-Type"))
+
+	if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+		boundary := params["boundary"]
+		if boundary == "" {
+			return "", fmt.Errorf("multipart email has no boundary")
+		}
+		reader := multipart.NewReader(body, boundary)
+		var parts []string
+
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return "", err
+			}
+			if strings.Contains(strings.ToLower(part.Header.Get("Content-Disposition")), "attachment") {
+				continue
+			}
+			value, err := decodeMIMEBody(part.Header, part)
+			if err == nil && strings.TrimSpace(value) != "" {
+				parts = append(parts, value)
+			}
+		}
+		return strings.Join(parts, "\n"), nil
+	}
+
+	var reader io.Reader = body
+	switch strings.ToLower(strings.TrimSpace(header.Get("Content-Transfer-Encoding"))) {
+	case "base64":
+		reader = base64.NewDecoder(base64.StdEncoding, body)
+	case "quoted-printable":
+		reader = quotedprintable.NewReader(body)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(reader, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	value := string(data)
+
+	if strings.EqualFold(mediaType, "text/html") {
+		value = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`).ReplaceAllString(value, " ")
+		value = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`).ReplaceAllString(value, " ")
+		value = regexp.MustCompile(`(?s)<[^>]+>`).ReplaceAllString(value, " ")
+		value = html.UnescapeString(value)
+	}
+	return value, nil
+}
+
 func (a *App) fetchEmails() ([]Notice, error) {
 	if a.cfg.gmailUser == "" || a.cfg.gmailPass == "" || a.cfg.famPaySender == "" {
 		return nil, fmt.Errorf("Gmail/FamPay configuration missing")
 	}
-	c, e := client.DialTLS(a.cfg.gmailHost+":"+a.cfg.gmailPort, nil)
-	if e != nil {
-		return nil, e
+
+	c, err := client.DialTLS(a.cfg.gmailHost+":"+a.cfg.gmailPort, nil)
+	if err != nil {
+		return nil, err
 	}
 	defer c.Logout()
-	if e = c.Login(a.cfg.gmailUser, a.cfg.gmailPass); e != nil {
-		return nil, e
+
+	if err = c.Login(a.cfg.gmailUser, a.cfg.gmailPass); err != nil {
+		return nil, err
 	}
-	box, e := c.Select("INBOX", false)
-	if e != nil {
-		return nil, e
+	box, err := c.Select("INBOX", false)
+	if err != nil {
+		return nil, err
 	}
 	if box.Messages == 0 {
 		return nil, nil
 	}
-	ids, e := c.Search(imap.NewSearchCriteria())
-	if e != nil {
-		return nil, e
+
+	ids, err := c.Search(imap.NewSearchCriteria())
+	if err != nil {
+		return nil, err
 	}
 	if len(ids) == 0 {
 		return nil, nil
 	}
+
 	start := 0
 	if len(ids) > 10 {
 		start = len(ids) - 10
 	}
 	set := new(imap.SeqSet)
 	set.AddNum(ids[start:]...)
+
 	ch := make(chan *imap.Message, 10)
 	done := make(chan error, 1)
 	section := new(imap.BodySectionName)
-	go func() { done <- c.Fetch(set, []imap.FetchItem{imap.FetchEnvelope, section.FetchItem()}, ch) }()
+
+	go func() {
+		done <- c.Fetch(set, []imap.FetchItem{
+			imap.FetchEnvelope,
+			imap.FetchInternalDate,
+			section.FetchItem(),
+		}, ch)
+	}()
+
 	var result []Notice
 	for m := range ch {
-		if m.Envelope == nil {
+		if m.Envelope == nil || len(m.Envelope.From) == 0 {
 			continue
 		}
-		sender := ""
-		if len(m.Envelope.From) > 0 {
-			sender = strings.ToLower(m.Envelope.From[0].Address())
-		}
+
+		sender := strings.ToLower(m.Envelope.From[0].Address())
 		if sender != a.cfg.famPaySender {
 			continue
 		}
-		raw := ""
-		if body := m.GetBody(section); body != nil {
-			buf := make([]byte, 1<<20)
-			n, _ := body.Read(buf)
-			raw = string(buf[:n])
-		}
-		subject := m.Envelope.Subject
-		parsed, _ := mail.ReadMessage(strings.NewReader(raw))
-		if parsed != nil {
-			buf := make([]byte, 1<<20)
-			n, _ := parsed.Body.Read(buf)
-			raw = string(buf[:n])
-			if parsed.Header.Get("Subject") != "" {
-				subject = parsed.Header.Get("Subject")
+
+		body := ""
+		if raw := m.GetBody(section); raw != nil {
+			data, _ := io.ReadAll(io.LimitReader(raw, 1<<20))
+			message, parseErr := mail.ReadMessage(strings.NewReader(string(data)))
+			if parseErr == nil {
+				body, _ = decodeMIMEBody(textproto.MIMEHeader(message.Header), message.Body)
 			}
 		}
-		full := subject + "\n" + raw
-		tid := ""
-		if x := txnRE.FindString(full); x != "" {
-			tid = strings.ToUpper(x)
+
+		subject := m.Envelope.Subject
+		if decoded, decodeErr := new(mime.WordDecoder).DecodeHeader(subject); decodeErr == nil {
+			subject = decoded
 		}
+
+		received := m.InternalDate
+		if received.IsZero() {
+			received = m.Envelope.Date
+		}
+		if received.IsZero() {
+			continue
+		}
+
+		full := subject + "\n" + body
 		var amount int64
-		if x := amountRE.FindStringSubmatch(full); len(x) > 1 {
-			amount, _ = money(x[1])
+		if match := amountRE.FindStringSubmatch(full); len(match) > 1 {
+			amount, _ = money(match[1])
 		}
+
+		// FamPay's own transaction ID / UTR is deliberately NOT matched
+		// against our generated MK transaction ID.
 		messageID := m.Envelope.MessageId
 		if messageID == "" {
 			messageID = fmt.Sprintf("seq-%d", m.SeqNum)
 		}
-		result = append(result, Notice{messageID, sender, subject, raw, tid, amount})
+
+		result = append(result, Notice{
+			id:       messageID,
+			sender:   sender,
+			subject:  subject,
+			body:     body,
+			amount:   amount,
+			received: received,
+		})
 	}
-	if e := <-done; e != nil {
-		return nil, e
+
+	if err := <-done; err != nil {
+		return nil, err
 	}
 	return result, nil
 }
+
 func (a *App) verify(id, kind string) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	p, e := a.get(id)
-	if e != nil {
-		return "", e
+
+	p, err := a.get(id)
+	if err != nil {
+		return "", err
 	}
 	if p.status != "PENDING" {
 		return p.status, nil
 	}
-	notices, e := a.fetchEmails()
-	if e != nil {
-		return "PENDING", e
+
+	notices, err := a.fetchEmails()
+	if err != nil {
+		return "PENDING", err
 	}
+
+	created := parseTime(p.created)
+	deadline := parseTime(p.deadline)
+
 	for _, n := range notices {
-		_, _ = a.db.Exec("INSERT OR IGNORE INTO emails(message_id,sender,subject,body,txn,amount,received,processed) VALUES(?,?,?,?,?,?,?,?)", n.id, n.sender, n.subject, n.body, n.txn, n.amount, time.Now().Format(time.RFC3339Nano), time.Now().Format(time.RFC3339Nano))
-		if n.txn == id && n.amount == p.amount && n.amount > 0 {
-			if e := a.mark(id, "PAID", kind, n.id); e != nil {
-				return "", e
-			}
-			return "PAID", nil
+		now := time.Now().Format(time.RFC3339Nano)
+		_, _ = a.db.Exec(
+			`INSERT OR IGNORE INTO emails(message_id,sender,subject,body,txn,amount,received,processed)
+ VALUES(?,?,?,?,?,?,?,?)`,
+			n.id, n.sender, n.subject, n.body, "", n.amount,
+			n.received.Format(time.RFC3339Nano), now,
+		)
+
+		// Require an incoming-payment notification, not a payment sent by us.
+		content := strings.ToLower(n.subject + "\n" + n.body)
+		if !strings.Contains(content, "received") {
+			continue
 		}
+		if strings.Contains(content, "successfully paid") ||
+			strings.Contains(content, "payment sent") ||
+			strings.Contains(content, "you paid") ||
+			strings.Contains(content, "debited") {
+			continue
+		}
+
+		if n.amount <= 0 || n.amount != p.amount {
+			continue
+		}
+
+		// Email must have arrived around this payment's creation and expiry.
+		if n.received.Before(created.Add(-2*time.Minute)) ||
+			n.received.After(deadline.Add(5*time.Minute)) {
+			continue
+		}
+
+		// Never reuse one notification to mark a second payment as paid.
+		var used int
+		err = a.db.QueryRow(
+			`SELECT COUNT(*) FROM verification_logs WHERE email_id=? AND result='PAID'`,
+			n.id,
+		).Scan(&used)
+		if err != nil {
+			return "", err
+		}
+		if used > 0 {
+			continue
+		}
+
+		// Amount-only matching is safe to automate only when exactly one
+		// pending payment of this amount fits the email's time window.
+		rows, err := a.db.Query(
+			`SELECT txn,created,deadline FROM payments WHERE amount=? AND status='PENDING'`,
+			n.amount,
+		)
+		if err != nil {
+			return "", err
+		}
+
+		candidates := 0
+		matchedThisPayment := false
+		for rows.Next() {
+			var candidateID, candidateCreated, candidateDeadline string
+			if err := rows.Scan(&candidateID, &candidateCreated, &candidateDeadline); err != nil {
+				rows.Close()
+				return "", err
+			}
+			start := parseTime(candidateCreated)
+			end := parseTime(candidateDeadline)
+			if !n.received.Before(start.Add(-2*time.Minute)) &&
+				!n.received.After(end.Add(5*time.Minute)) {
+				candidates++
+				if candidateID == id {
+					matchedThisPayment = true
+				}
+			}
+		}
+		rows.Close()
+
+		if candidates != 1 || !matchedThisPayment {
+			continue
+		}
+
+		if err := a.mark(id, "PAID", kind, n.id); err != nil {
+			return "", err
+		}
+		return "PAID", nil
 	}
+
 	return "PENDING", nil
 }
 func (a *App) confirm(w http.ResponseWriter, r *http.Request) {
@@ -452,14 +621,16 @@ func (a *App) scheduler() {
 		}
 	}
 }
+
 func (a *App) payPage(w http.ResponseWriter, r *http.Request) {
-	p, e := a.get(strings.TrimPrefix(r.URL.Path, "/pay/"))
-	if e != nil {
+	p, err := a.get(strings.TrimPrefix(r.URL.Path, "/pay/"))
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, payHTML, pageCSS, float64(p.amount)/100, p.txn, p.txn, p.txn, parseTime(p.deadline).UnixMilli())
+	qrDeadline := parseTime(p.created).Add(time.Duration(a.cfg.qrMins) * time.Minute)
+	fmt.Fprintf(w, payHTML, pageCSS, float64(p.amount)/100, p.txn, p.txn, p.txn, qrDeadline.UnixMilli())
 }
 func (a *App) qrPage(w http.ResponseWriter, r *http.Request) {
 	p, e := a.get(strings.TrimPrefix(r.URL.Path, "/qr/"))
@@ -486,6 +657,72 @@ func (a *App) qrImage(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(png)
 }
 
-const payHTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment</title><style>%s</style></head><body><main class="card"><div class="brand">MRKRISHNA <span>PAYMENTS</span></div><p class="eyebrow">PAYMENT CHECKOUT</p><h1>Complete your payment</h1><div class="amount">₹%.2f</div><p class="muted">Transaction ID · <b>%s</b></p><div class="qr"><img src="/api/qr/%s"></div><p class="muted">Scan with your UPI application.</p><p class="timer">QR timer <b id="timer">10:00</b></p><button id="check">I've paid · Check payment</button><p id="status">Waiting for payment confirmation</p></main><div id="modal" class="modal hide"><div class="dialog"><h2>Have you completed payment?</h2><p>Confirm only after completing your UPI payment.</p><button class="secondary" id="cancel">Cancel</button><button id="yes">Confirm payment</button></div></div><script>const txn=%q,deadline=%d;const $=x=>document.getElementById(x);function tick(){let n=Math.max(0,deadline-Date.now());$('timer').textContent=String(Math.floor(n/60000)).padStart(2,'0')+':'+String(Math.floor(n%60000/1000)).padStart(2,'0')}tick();setInterval(tick,1000);$('check').onclick=()=>$('modal').classList.remove('hide');$('cancel').onclick=()=>$('modal').classList.add('hide');$('yes').onclick=async()=>{$('modal').classList.add('hide');try{let r=await fetch('/api/payments/'+txn+'/confirm',{method:'POST'});let d=await r.json();$('status').textContent=d.message||d.status||d.error||'Request received'}catch(e){$('status').textContent='Could not schedule verification'}};setInterval(poll,15000);</script></body></html>`
+const payHTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment</title><style>%s</style></head><body><main class="card"><div class="brand">MRKRISHNA <span>PAYMENTS</span></div><p class="eyebrow">PAYMENT CHECKOUT</p><h1>Complete your payment</h1><div class="amount">₹%.2f</div><p class="muted">Transaction ID · <b>%s</b></p><div class="qr"><img src="/api/qr/%s" alt="UPI payment QR code"></div><p class="muted">Scan with your UPI application.</p><p class="timer">QR timer <b id="timer">10:00</b></p><button id="check" type="button">I've paid · Check payment</button><p id="status" aria-live="polite">Waiting for payment confirmation</p></main><div id="modal" class="modal hide" role="dialog" aria-modal="true"><div class="dialog"><h2>Have you completed payment?</h2><p>Confirm only after completing your UPI payment.</p><button class="secondary" id="cancel" type="button">Cancel</button><button id="yes" type="button">Confirm payment</button></div></div><script>
+const txn=%q,deadline=%d;
+const $=id=>document.getElementById(id);
+let checking=false, poller;
+function tick(){
+ const left=Math.max(0,deadline-Date.now());
+ $('timer').textContent=String(Math.floor(left/60000)).padStart(2,'0')+':'+String(Math.floor(left%60000/1000)).padStart(2,'0');
+}
+tick();
+setInterval(tick,1000);
+
+$('check').addEventListener('click',()=> $('modal').classList.remove('hide'));
+$('cancel').addEventListener('click',()=> $('modal').classList.add('hide'));
+
+async function poll(){
+ if(checking)return;
+ checking=true;
+ try{
+  const response=await fetch('/cheque?value='+encodeURIComponent(txn),{cache:'no-store'});
+  const data=await response.json();
+  if(data.status==='PAID'){
+   $('status').textContent='Payment verified successfully.';
+   $('check').textContent='Payment verified';
+   $('check').disabled=true;
+   clearInterval(poller);
+  }else if(data.status==='FAILED'){
+   $('status').textContent='Payment window expired. Contact support if you have paid.';
+   clearInterval(poller);
+  }else if(!response.ok){
+   $('status').textContent='Verification unavailable. Retrying...';
+  }else{
+   $('status').textContent='Payment not found yet. Checking again...';
+  }
+ }catch(error){
+  $('status').textContent='Connection problem. Retrying payment check...';
+ }finally{
+  checking=false;
+ }
+}
+
+$('yes').addEventListener('click',async()=>{
+ $('modal').classList.add('hide');
+ $('yes').disabled=true;
+ $('status').textContent='Your confirmation was received. Checking payment...';
+ try{
+  const response=await fetch('/api/payments/'+encodeURIComponent(txn)+'/confirm',{
+   method:'POST',
+   headers:{'Content-Type':'application/json'}
+  });
+  const data=await response.json();
+  if(!response.ok){
+   $('status').textContent=data.error||'Could not schedule verification.';
+  }else{
+   $('status').textContent=data.message||'Checking payment...';
+   await poll();
+  }
+ }catch(error){
+  $('status').textContent='Could not contact the payment server. Retrying...';
+ }finally{
+  $('yes').disabled=false;
+ }
+});
+
+poll();
+poller=setInterval(poll,15000);
+</script></body></html>`
+
 const qrHTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>UPI QR</title><style>%s</style></head><body><main class="card"><div class="brand">MRKRISHNA <span>PAYMENTS</span></div><p class="eyebrow">SCAN TO PAY</p><div class="amount">₹%.2f</div><p class="muted">Transaction ID · <b>%s</b></p><div class="qr"><img src="/api/qr/%s"></div><p class="muted">Scan using your UPI application.</p></main></body></html>`
 const pageCSS = `*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;background:radial-gradient(circle at top,#222342,#090b12 60%);color:#f5f6fb;font:15px system-ui,sans-serif}.card{width:min(100%,430px);padding:30px 24px;text-align:center;background:#171a29;border:1px solid #30344a;border-radius:22px;box-shadow:0 25px 80px #0008}.brand{font-weight:800;letter-spacing:.16em;font-size:13px}.brand span,.muted{color:#a5abc0}.eyebrow{margin:30px 0 8px;color:#999fbb;font-size:10px;letter-spacing:.2em}h1{font-size:24px;margin:0}.amount{font-size:38px;font-weight:800;margin:12px}.muted{font-size:13px}.qr{width:240px;height:240px;padding:10px;margin:24px auto 12px;background:white;border-radius:14px}.qr img{width:100%;height:100%}.timer{padding:12px;border:1px solid #343950;border-radius:12px;color:#abb0c6}button{width:100%;padding:14px;border:0;border-radius:11px;background:#897bff;color:white;font-weight:700;cursor:pointer;margin-top:8px}.secondary{background:#34384c}.modal{position:fixed;inset:0;background:#000b;display:grid;place-items:center;padding:20px}.hide{display:none}.dialog{width:min(100%,360px);padding:24px;border-radius:18px;background:#1a1d2c;border:1px solid #383d54}.dialog p,#status{color:#aeb3c8;font-size:13px}.dialog button{width:48%;margin:12px 1% 0}`
